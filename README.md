@@ -78,7 +78,7 @@ cargo build --release --locked
 cargo run --release --locked
 ```
 
-第一条编译；第二条通过调试器烧录并显示 RTT 日志。模板启动日志为 `change me`，可以改成自己的标识。电脑上结束日志会话不等于给电机发送停止指令。
+第一条编译；第二条通过调试器烧录并显示 RTT 日志。模板启动日志为 `Gimbal control started`，可以改成自己的标识。电脑上结束日志会话不等于给电机发送停止指令。
 
 ### 3. 一个控制周期做什么？
 
@@ -120,13 +120,11 @@ let speed = motor.speed_rpm;
 motor.command_current_a = 0.0;
 ```
 
-`motors` 的类型是 `[Option<Motor>; 4]`，四个槽位对应电机 ID 1～4。`Some(...)` 表示配置了电机，`None` 表示该槽位未使用。模板初始为 `[None; 4]`。
-
-两轴的目标和 PID 放在 `Control` 的 `yaw`、`pitch` 中，类型为 `Axis`：
+两轴放在 `Control` 的 `yaw`、`pitch` 中，类型为 `Axis`，各自包含电机、目标和 PID：
 
 ```rust
 pub struct Axis {
-    pub slot: usize,
+    pub motor: Motor,
     pub target_angle_rad: f32,
     pub target_rpm: f32,
     pub position_pid: Pid,
@@ -136,7 +134,7 @@ pub struct Axis {
 
 | 字段 | 含义 | 单位／注意事项 |
 |---|---|---|
-| `slot` | 该轴电机在 `motors` 中的下标 | 电机 ID 减 1；模板默认 yaw 为 0、pitch 为 1，需按教具配置修改 |
+| `motor` | 该轴的电机 | 电机 ID 由教具配置给出 |
 | `target_angle_rad` | 希望达到的角度 | rad；是位置环目标 |
 | `target_rpm` | 希望达到的电机轴转速 | rpm；是速度环目标，由位置环输出给出 |
 | `position_pid` | 位置环 | 输入 rad，输出 rpm |
@@ -144,23 +142,21 @@ pub struct Axis {
 
 ### 5. 电机指令怎样发出去？
 
-模板留了两个协议接口：
+协议部分有两处需要你补全：
 
-```rust
-pub fn read(&mut self, _data: &[u8; 8])
-pub fn transmit(_motors: &[Option<Motor>; 4]) -> [u8; 8]
-```
+- `Motor::read(&mut self, data: &[u8; 8])`：把一帧八字节反馈转换成角度、速度和电流。反馈帧应该怎样对应到 yaw 或 pitch，请查手册并补全 `Control::read_feedback`。
+- `Control::transmit` 中的 `data`：把两轴的 `command_current_a` 限幅、换算后写入各自电机 ID 对应的字节，其他字节保持为零。
 
-`Motor::read` 把一帧八字节反馈转换成角度、速度和电流。`Motor::transmit` 做反向工作：将四个槽位的电流指令打包成八字节，未使用的槽位填零。当前模板用 `MOTOR_COMMAND_ID = 0x1FE` 发送电流模式组指令。反馈帧应该怎样对应到电机，请查手册并补全 `Control::read_feedback`。
+模板用 `MOTOR_COMMAND_ID = 0x1FE` 发送电流模式组指令。`Control::transmit` 每个周期都会发送一帧，模板中 `data` 全为零，所以未补全前电机只会收到零电流。发送队列满时（例如总线上没有电机应答）这一帧会被丢弃，并计入全局计数 `TX_FAILED`，不会 panic。接收到的 CAN 总线错误交给 `dm_mc02::log_can_error`，计入 `CAN_ERRORS`。
 
 已有停止接口：
 
 ```rust
 motor.disable();   // 清除这个电机的电流指令
-self.disable_all(); // 在 Control 内清除全部已配置电机的指令
+self.disable_all(); // 清除两轴电机的指令
 ```
 
-这两者只修改内存，**不会自己发送 CAN 帧**。`Control::transmit` 每周期调用 `Motor::transmit` 编码并发送帧，你需要保证编码函数把零电流正确编码为协议零值。零电流也不等于主动刹车或保持原角度。
+这两者只修改内存，**不会自己发送 CAN 帧**，要等 `Control::transmit` 在本周期末尾发送，所以停止依赖发送正常工作。你需要保证零电流被编码为协议零值。零电流也不等于主动刹车或保持原角度。
 
 ### 6. 遥控器怎么用？
 
@@ -293,7 +289,7 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 
 回正超时或出现异常，应退出并停止输出。
 
-模板已允许 `Prepare` 和 `Running` 在遥控输入有效时发送输出，`Waiting`、`Error` 或遥控输入无效时会清零。无需再修改发送状态许可；电机反馈有效性、回正限速限流及状态切换仍由你实现。
+遥控输入无效时，模板会清零指令并回到 `Waiting`。其余情况下发送阶段不再检查状态：`Waiting` 和 `Error` 下的零输出需要你在 `Control::update` 中调用 `disable_all` 实现。电机反馈有效性、回正限速限流及状态切换也由你实现。
 
 ### 3. 调试：遥控器控制云台
 
@@ -323,14 +319,14 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 | `Pid` | 添加参数、积分、历史数据及限制 |
 | `Pid::reset` | 清理历史状态，定义首次计算的初始化方式 |
 | `Pid::calculate` | 使用时间间隔计算 PID，处理积分与输出限制 |
-| `Control`、`Default` | 设置两轴的 `slot` 和 PID 参数，添加反馈年龄、故障记录等 |
+| `Control`、`Default` | 设置两轴的 PID 参数，添加反馈年龄、故障记录等 |
 | `Control::update_mode` | 完整的判断、切换和进入／退出处理 |
 | `Control::update` | 回正、遥控双环控制及禁止输出状态下的具体行为 |
-| `Motor::read`、`Motor::transmit` | 根据电机手册完成解码、换算、限幅与编码 |
+| `Motor::read`、`Control::transmit` | 根据电机手册完成解码、换算、限幅与编码 |
 | `Control::read_feedback` | 筛选反馈帧、检查长度、路由到电机，并更新反馈年龄 |
 | 自行新增的检测函数 | 卡住、持续振荡、回正完成及回正超时等判断 |
 
-`Motor::read`、`Motor::transmit` 和 `Control::read_feedback` 中的路由都需要自己完成。先根据手册把反馈接收、解码和指令编码跑通，确认角度、速度及单位正确，再开始 PID 调试。
+`Motor::read`、`Control::transmit` 中的编码和 `Control::read_feedback` 中的路由都需要自己完成。先根据手册把反馈接收、解码和指令编码跑通，确认角度、速度及单位正确，再开始 PID 调试。
 
 底层 CAN 初始化、缓冲队列和非阻塞收发入口已经提供，不需要重写。但接收循环取到的帧还没有自动变成电机反馈：你仍需筛选 ID、检查长度、找到对应电机并调用 `Motor::read`，同时记录反馈年龄。缺少这一步，PID 没有有效反馈，不能进行闭环调试。
 
@@ -370,7 +366,7 @@ cargo run --release --locked
 1. 命令面板执行 `Tuning Studio: Open Scope`，打开 Tuning Scope 面板。
 2. 点击面板左上角 **Open firmware…**，选择本次烧录对应的 `target/thumbv7em-none-eabihf/release/control-training-template`。这是不带扩展名的固件文件，不是 `.rs` 源码。不要选择旧编译结果。
 3. 点击右上角 **Connect…**，选择 SWD 调试探针和芯片 `STM32H723VGTx`。
-4. 左侧 Live Watch 中展开 **Tasks → control_task → control**，里面是 `Control` 的全部字段，例如 `motors`、`yaw`、`state`。顶部输入框可按名称筛选。
+4. 左侧 Live Watch 中展开 **Tasks → control_task → control**，里面是 `Control` 的全部字段，例如 `yaw`、`pitch`、`state`。顶部输入框可按名称筛选。
 5. 点击数值右侧的方块，把该字段加入右侧曲线；再点一次取消。
 6. 工具栏可选择 2、5、10、30 s 时间窗口，**Pause** 暂停画面，**Record** 开始记录到工程的 `.tuning-studio/recordings/`，再点一次停止。
 

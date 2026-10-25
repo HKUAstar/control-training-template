@@ -4,33 +4,37 @@
 
 mod dm_mc02;
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use dm_mc02::Can1;
 use embassy_executor::Spawner;
 use embassy_stm32::can::Frame;
-use embassy_time::{Duration, Ticker};
+use embassy_time::{Duration, Instant, Ticker};
 
 // GM6020 current-mode group command for motor IDs 1 to 4.
 const MOTOR_COMMAND_ID: u16 = 0x1FE;
-// CAN frames read per tick, and ticks without remote input before it counts as lost.
-const MAX_RX_FRAMES_PER_TICK: usize = 8;
+// Ticks without remote input before it counts as lost.
 const REMOTE_SILENT_TICKS: u16 = 100;
+const TICK: Duration = Duration::from_millis(1);
+
+/// Command frames dropped because the CAN transmit queue was full, for example while no
+/// motor acknowledges frames.
+pub static TX_FAILED: AtomicU32 = AtomicU32::new(0);
 
 /// Feedback and current command for one motor.
-/// `Motor::read` and `Motor::transmit` convert between these fields and CAN values.
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 pub struct Motor {
     /// Single-turn motor shaft angle in rad; turns are not counted.
     pub angle_rad: f32,
     pub speed_rpm: f32,
     /// Feedback current as sent on the wire. The motor manual gives no scale to amperes.
     pub current_raw: i16,
-    /// Current command in A, encoded by `Motor::transmit`.
+    /// Current command in A, encoded by `Control::transmit`.
     pub command_current_a: f32,
 }
 
 impl Motor {
-    /// Clear the current command in RAM. This sends no CAN frame;
-    /// the motor receives zero only when `Control::transmit` next runs.
+    /// Clear the current command in RAM. The motor receives zero when
+    /// `Control::transmit` next runs, within 1 ms.
     pub fn disable(&mut self) {
         self.command_current_a = 0.0;
     }
@@ -39,16 +43,11 @@ impl Motor {
         // TODO: decode angle, speed and current as the manual describes.
         todo!("Decode motor feedback");
     }
-
-    /// Pack the commands for motor IDs 1 to 4. `None` slots encode zero.
-    pub fn transmit(_motors: &[Option<Motor>; 4]) -> [u8; 8] {
-        // TODO: limit, convert and pack each current command.
-        todo!("Encode the four motor commands");
-    }
 }
 
 /// PID gains, plus the integral and history kept between ticks.
 // TODO: add gains, history, an integral limit and a symmetric output limit `maxout`.
+#[derive(Default)]
 pub struct Pid {}
 
 impl Pid {
@@ -81,10 +80,10 @@ pub enum State {
     Error,
 }
 
-/// One gimbal axis: its motor slot, targets and cascaded PIDs.
+/// One gimbal axis: its motor, targets and cascaded PIDs.
+#[derive(Default)]
 pub struct Axis {
-    /// Index into `Control::motors`, which is the motor ID minus 1.
-    pub slot: usize,
+    pub motor: Motor,
     /// Position loop target in rad.
     pub target_angle_rad: f32,
     /// Speed loop target in rpm, set from the position loop output.
@@ -95,40 +94,24 @@ pub struct Axis {
     pub speed_pid: Pid,
 }
 
-impl Axis {
-    pub const fn new(slot: usize) -> Self {
-        Self {
-            slot,
-            target_angle_rad: 0.0,
-            target_rpm: 0.0,
-            position_pid: Pid {},
-            speed_pid: Pid {},
-        }
-    }
-}
-
 /// State shared by every control tick.
 // TODO: add feedback ages and a fault record.
 pub struct Control {
     pub state: State,
-    /// Slots hold motor IDs 1 to 4.
-    pub motors: [Option<Motor>; 4],
     pub yaw: Axis,
     pub pitch: Axis,
     pub remote: Option<dm_mc02::Dr16>,
-    remote_silent_ticks: u16,
+    pub remote_silent_ticks: u16,
 }
 
-/// Start in `Waiting` with no motors and no remote input.
-/// Set the initial value of each field you add here.
+/// Start in `Waiting` with no remote input.
+/// Set the initial value of each field you add here, including the PID gains.
 impl Default for Control {
     fn default() -> Self {
         Self {
             state: State::Waiting,
-            motors: [None; 4],
-            // TODO: use the motor IDs from the rig configuration.
-            yaw: Axis::new(0),
-            pitch: Axis::new(1),
+            yaw: Axis::default(),
+            pitch: Axis::default(),
             remote: None,
             remote_silent_ticks: REMOTE_SILENT_TICKS,
         }
@@ -136,11 +119,10 @@ impl Default for Control {
 }
 
 impl Control {
-    /// Disable every configured motor. This only clears commands in RAM.
+    /// Clear both motors' current commands in RAM.
     pub fn disable_all(&mut self) {
-        for motor in self.motors.iter_mut().flatten() {
-            motor.disable();
-        }
+        self.yaw.motor.disable();
+        self.pitch.motor.disable();
     }
 
     /// Runs every 1 ms: read the remote and motor feedback, update the state, then
@@ -175,16 +157,18 @@ impl Control {
         }
     }
 
-    /// Read up to `MAX_RX_FRAMES_PER_TICK` queued CAN frames without waiting for more.
+    /// Read every queued CAN frame without waiting for more.
     pub fn read_feedback(&mut self, can: &mut Can1) {
         let receiver = can.reader();
-        for _ in 0..MAX_RX_FRAMES_PER_TICK {
-            let Ok(Ok(envelope)) = receiver.try_receive() else {
-                break;
-            };
-            // TODO: check the ID and length, pass the data to the matching motor's
-            // `Motor::read`, and record its feedback age.
-            let _frame = envelope.frame;
+        while let Ok(received) = receiver.try_receive() {
+            match received {
+                Ok(envelope) => {
+                    // TODO: check the ID and length, pass the data to the matching axis's
+                    // `Motor::read`, and record its feedback age.
+                    let _frame = envelope.frame;
+                }
+                Err(error) => dm_mc02::log_can_error(error),
+            }
         }
     }
 
@@ -208,48 +192,50 @@ impl Control {
     }
 
     /// Set targets for the current state, run each axis's PIDs and write the current commands.
-    // TODO: limited recentering, remote cascade control, and zero output elsewhere.
-    // Each tick is 0.001 s.
+    // TODO: limited recentering in Prepare, remote cascade control in Running, and
+    // `disable_all` in Waiting and Error. Each tick is 0.001 s.
     pub fn update(&mut self) {}
 
-    /// Encode the four current commands into one group frame and queue it on CAN1
-    /// without waiting. Sends nothing while no motor is configured. A full transmit
-    /// queue panics, which leads to the watchdog reset lockout.
+    /// Queue one group command frame on CAN1 without waiting. This runs every tick, so a
+    /// cleared command reaches the motor within 1 ms. A full queue drops the frame and
+    /// counts it in `TX_FAILED`.
     pub fn transmit(&mut self, can: &mut Can1) {
-        if self.motors.iter().all(Option::is_none) {
-            return;
-        }
-        // Only Prepare and Running may drive the motors, and only with valid remote input.
-        if self.remote.is_none() || !matches!(self.state, State::Prepare | State::Running) {
-            self.disable_all();
-        }
-        let data = Motor::transmit(&self.motors);
+        let data = [0u8; 8];
+        // TODO: limit and convert each axis's `command_current_a`, and write it into the
+        // bytes for its motor ID as the manual describes. Other motor IDs stay zero.
         let frame = Frame::new_standard(MOTOR_COMMAND_ID, &data).unwrap();
-        can.writer()
-            .try_write(frame)
-            .expect("CAN1 transmit queue full");
+        if can.writer().try_write(frame).is_err() {
+            TX_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
-// Firmware entry: set up RTT, the board and its interfaces, then start both tasks.
-// The remote task receives input; the control task owns CAN and the watchdog.
+// Set up RTT and the board, then start the remote and control tasks.
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     rtt_target::rtt_init_print!(rtt_target::ChannelMode::NoBlockTrim, 1024);
     let (can, watchdog, remote) = dm_mc02::init();
-    rtt_target::rprintln!("change me");
+    rtt_target::rprintln!("Gimbal control started");
     spawner.spawn(dm_mc02::remote_task(remote).unwrap());
     spawner.spawn(control_task(can, watchdog).unwrap());
 }
 
-// Run `tick` at 1 kHz and feed the watchdog after each one. A tick must finish
-// within 1 ms; if it hangs, the watchdog resets the MCU.
+// Run `tick` at 1 kHz and feed the watchdog after each one. If a tick hangs, the watchdog
+// resets the MCU after 100 ms.
 #[embassy_executor::task]
 async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
     let mut control = Control::default();
-    let mut ticker = Ticker::every(Duration::from_millis(1));
+    let mut ticker = Ticker::every(TICK);
+    let mut last = Instant::now();
     loop {
         ticker.next().await;
+        // After a stall, such as the 20 ms halt when a debug probe attaches, start the
+        // schedule again instead of running every missed tick back to back.
+        let now = Instant::now();
+        if now - last > TICK * 2 {
+            ticker.reset();
+        }
+        last = now;
         control.tick(&mut can);
         watchdog.pet();
     }
