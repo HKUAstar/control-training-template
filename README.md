@@ -64,15 +64,24 @@ Students must implement the transmit stage to send those zero commands over CAN.
 每个周期在非 `Running` 模式下清零，再进入发送阶段。仍需实现 CAN 发送才能让电机收到零指令。
 
 IWDG1 runs with a nominal 100 ms timeout and is fed only after a completed control tick.
-If the task hangs, the watchdog resets the MCU. On panic, interrupts are disabled, the panic
-message is written to nonblocking RTT, and the watchdog is reconfigured for its shortest timeout.
-At nominal 32 kHz LSI, that is about 125 us after synchronization and reload, not an instant reset.
-RTT delivery is best effort; the host may not read the panic text before RAM is reinitialized.
+If the task hangs, the watchdog resets the MCU. On panic, interrupts are disabled and a fresh
+nominal 100 ms watchdog deadline is armed, including for panics before normal initialization.
+The RTT channel switches to blocking mode for the panic message and flushes it so the probe can
+read it before reset. Normal logging stays nonblocking. If there is no reader, the watchdog ends
+the wait. This allows up to nominally 100 ms of extra time before MCU/CAN reset on panic.
 
-IWDG1 的标称超时时间为 100 ms，只在控制周期完成后喂狗，任务卡死会导致看门狗复位。
-panic 时禁用中断，将消息写入非阻塞 RTT，再把看门狗设为最短超时。
-32 kHz 标称 LSI 下，同步和重装后约 125 us 复位，并非立即复位。
-RTT 消息不保证送达，主机可能来不及在 RAM 重新初始化之前读取 panic 信息。
+任务卡死会导致看门狗复位。panic 时禁用中断，并重新设置标称 100 ms 的看门狗期限，
+也覆盖正常初始化之前发生的 panic。RTT 为 panic 消息切换至阻塞模式，并等待探针读走消息。
+正常日志仍为非阻塞。没有主机读取时，看门狗会结束等待。
+这意味着 panic 后 MCU/CAN 复位前可能额外等待标称 100 ms。
+
+Once the probe has read the message, the watchdog is configured for its shortest timeout.
+At nominal 32 kHz LSI, that is about 125 us after synchronization and reload, not an instant reset.
+Delivery is still best effort if the host is too slow, and debug watchdog-freeze settings can
+prevent the watchdog from bounding the wait while the core is halted.
+
+探针读走消息后，看门狗切换到最短超时；32 kHz 标称 LSI 下，同步和重装后约 125 us 复位。
+如果主机读取过慢，消息仍可能丢失。调试时若配置了看门狗冻结，内核暂停期间的等待将不再有此期限。
 
 On a watchdog reset, `dm_mc02::init()` clears the reset flags, prints a lockout message, and spins
 before enabling CAN or starting the student task. Press RESET to run again; a power cycle also

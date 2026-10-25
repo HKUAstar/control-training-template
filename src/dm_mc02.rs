@@ -6,6 +6,7 @@
 //! TIM2 provides Embassy's time driver, so keep it reserved for timers and the control ticker.
 //! TIM2 用作 Embassy 时间驱动，请勿将其用于其他外设功能。
 
+use core::fmt::Write as _;
 use core::num::{NonZeroU8, NonZeroU16};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -98,18 +99,18 @@ pub fn init() -> (Can<'static>, Watchdog) {
 }
 
 // ========= Panic watchdog reset / Panic 看门狗复位 =========
-/// Force a watchdog reset even if panic occurred before normal initialization.
-/// 即使 panic 发生在正常初始化之前，也通过看门狗触发复位。
+/// Configure the panic-only watchdog path, including before normal initialization.
+/// 配置仅用于 panic 的看门狗路径，也适用于正常初始化之前。
 ///
 /// This terminal path uses PAC registers because the task owns the HAL watchdog token.
 /// 此终止路径使用 PAC 寄存器，因为 HAL 看门狗句柄由任务持有。
-/// With prescaler 4 and reload 0, expiry takes roughly 125 us at nominal 32 kHz LSI,
-/// plus register synchronization. This is not a synchronous reset instruction.
-/// 分频为 4、重装值为 0 时，32 kHz 标称 LSI 下约 125 us 超时，另需寄存器同步时间。
-/// 它不是同步复位指令。
+/// At nominal 32 kHz LSI, reload 799 gives 100 ms and reload 0 gives 125 us,
+/// plus register synchronization. Neither duration is an exact wall-clock guarantee.
+/// 在 32 kHz 标称 LSI 下，重装值 799 对应 100 ms，0 对应 125 us，另需寄存器同步时间。
+/// 两种时长都不是精确的实际时间保证。
 /// See RM0468, independent watchdog (IWDG) and RCC reset-status register (RCC_RSR).
 /// 参见 RM0468 的独立看门狗和 RCC 复位状态寄存器章节。
-fn panic_reset() -> ! {
+fn configure_panic_watchdog(reload: u16) {
     use pac::iwdg::vals::{Key, Pr};
 
     let wdg = pac::IWDG1;
@@ -119,22 +120,21 @@ fn panic_reset() -> ! {
         core::hint::spin_loop();
     }
     wdg.pr().write(|w| w.set_pr(Pr::DIVIDE_BY4));
-    wdg.rlr().write(|w| w.set_rl(0));
+    wdg.rlr().write(|w| w.set_rl(reload));
     while wdg.sr().read().pvu() || wdg.sr().read().rvu() {
         core::hint::spin_loop();
     }
     wdg.kr().write(|w| w.set_key(Key::RESET));
-    loop {
-        core::hint::spin_loop();
-    }
 }
 
 // ========= Panic shutdown / Panic 停机 =========
-/// Print once without waiting for the host, then force an independent-watchdog reset.
-/// 不等待主机，尝试打印一次消息，然后触发独立看门狗复位。
+/// Give blocking panic output a watchdog deadline, then request a short watchdog reset.
+/// 为阻塞式 panic 输出设置看门狗期限，然后请求短超时看门狗复位。
 ///
-/// RTT delivery is best effort: reset can occur before the host reads the message.
-/// RTT 消息不保证送达：主机读取之前可能已经复位。
+/// Allow nominally 100 ms for RTT writing and flushing, even if no host is connected.
+/// 即使未连接主机，也只给 RTT 写入和刷新留出标称 100 ms 时间。
+/// Delivery is still best effort; the watchdog expires if the host cannot keep up.
+/// 消息仍不保证送达，主机读取不及时会导致看门狗超时。
 /// Interrupts stay disabled so no interrupt can feed the watchdog or continue CAN service.
 /// 禁用中断，防止中断继续喂狗或执行 CAN 服务。
 /// On the next boot, dm_mc02::init halts before CAN and student code until a manual reset.
@@ -145,7 +145,19 @@ fn panic(info: &PanicInfo<'_>) -> ! {
 
     cortex_m::interrupt::disable();
     if !PANICKED.swap(true, Ordering::Relaxed) {
-        rtt_target::rprintln!("{}", info);
+        // Arm before logging, including for panics before init started the normal watchdog.
+        // 打印前先启动看门狗，也覆盖正常看门狗尚未启动时发生的 panic。
+        configure_panic_watchdog(799);
+        rtt_target::with_terminal_channel(|term| {
+            term.set_mode(rtt_target::ChannelMode::BlockIfFull);
+            let _ = writeln!(term.write(0), "{}", info);
+            // Wait for the probe to read the message; the watchdog bounds this wait.
+            // 等待探针读走消息，看门狗限制此处等待时间。
+            term.flush();
+        });
     }
-    panic_reset()
+    configure_panic_watchdog(0);
+    loop {
+        core::hint::spin_loop();
+    }
 }
