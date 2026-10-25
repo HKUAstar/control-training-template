@@ -100,7 +100,8 @@ self.transmit(can);      // 把计算结果真正发给电机
 pub struct Motor {
     pub angle_rad: f32,
     pub speed_rpm: f32,
-    pub current_a: f32,
+    pub current_raw: i16,
+    pub target_angle_rad: f32,
     pub target_rpm: f32,
     pub command_current_a: f32,
 }
@@ -110,8 +111,9 @@ pub struct Motor {
 |---|---|---|
 | `angle_rad` | 当前电机轴角度 | rad；模板尚未实现多圈累计 |
 | `speed_rpm` | 当前电机轴转速 | rpm |
-| `current_a` | 反馈电流 | A |
-| `target_rpm` | 希望达到的电机轴转速 | rpm；是速度环目标 |
+| `current_raw` | 反馈电流 | 协议原始值；手册未给出换算到 A 的比例 |
+| `target_angle_rad` | 希望达到的电机轴角度 | rad；是角度环目标 |
+| `target_rpm` | 希望达到的电机轴转速 | rpm；是速度环目标，由角度环输出给出 |
 | `command_current_a` | 控制器计算的电流指令 | A；发送前还要换算成协议数值 |
 
 例如，在已经取得有效电机对象后，可以这样访问字段：
@@ -143,7 +145,7 @@ motor.disable();   // 清除这个电机的目标速度和电流指令
 self.disable_all(); // 在 Control 内清除全部已配置电机的指令
 ```
 
-这两者只修改内存，**不会自己发送 CAN 帧**。新版发送阶段已经负责调用编码函数并发送帧，但你仍需保证编码函数把零电流正确编码为协议零值。零电流也不等于主动刹车或保持原角度。
+这两者只修改内存，**不会自己发送 CAN 帧**。`Control::transmit` 每周期调用 `Motor::transmit` 编码并发送帧，你需要保证编码函数把零电流正确编码为协议零值。零电流也不等于主动刹车或保持原角度。
 
 ### 6. 遥控器怎么用？
 
@@ -223,9 +225,14 @@ impl Pid {
 
 上面是接口节选，不是完整实现。速度环输入为 rpm，输出为 A，每次调用的 `dt_s` 为 `0.001`。你需要添加增益、积分、历史数据和限制，并完成 `reset`、`calculate`。
 
-双环的连接为：目标角度交给角度环，角度环给出目标速度，再交给速度环，最后得到电流指令。yaw 和 pitch 的两个环都需要各自的历史状态，不能共用同一个 PID 实例。
+双环的连接为：`target_angle_rad` 交给角度环，角度环给出 `target_rpm`，再交给速度环，最后得到 `command_current_a`。`Control` 已为每个电机槽位准备了各自的 PID：
 
-模板尚无目标角度字段和角度环。需要新增它们，并明确角度环输入为 rad、输出为 rpm。PID 接口已采用通用的 `target`、`measured` 命名，每一处调用的单位必须写清楚。若角度环直接输出 rad/s，则先换算成 rpm 再接速度环。
+```rust
+pub angle_pid: [Pid; 4], // 角度环：输入 rad，输出 rpm
+pub speed_pid: [Pid; 4], // 速度环：输入 rpm，输出 A
+```
+
+下标与 `motors` 相同。yaw 和 pitch 使用各自槽位的 PID，不能共用同一个实例。若角度环输出 rad/s，先换算成 rpm 再接速度环。
 
 ### 9. 状态机是什么？
 
@@ -242,16 +249,14 @@ pub enum State {
 }
 ```
 
-初始状态为 `Waiting`。`update_mode` 中已经搭好下面的结构，但分支内容还需要填写：
+| 状态 | 在等什么／做什么 |
+|---|---|
+| `Waiting` | 零输出。等待遥控输入有效、两轴反馈新鲜，再等一次新的使能操作 |
+| `Prepare` | 回正：限速限流地把两轴转到参考姿态，等两轴稳定后进入 `Running` |
+| `Running` | 遥控调试：左摇杆移动目标角度，两轴双环跟随 |
+| `Error` | 零输出，等待人工恢复 |
 
-```rust
-match self.state {
-    State::Waiting => { /* 判断什么时候允许启动 */ }
-    State::Prepare => { /* 准备、回正及完成判断 */ }
-    State::Running => { /* 调试中的切换判断 */ }
-    State::Error => { /* 等待人工恢复 */ }
-}
-```
+初始状态为 `Waiting`。`update_mode` 中已经搭好 `match self.state` 的四个分支，分支内容还需要填写。
 
 ## 三、你需要把它做成什么样？
 
@@ -310,7 +315,7 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 | `Pid` | 添加参数、积分、历史数据及限制 |
 | `Pid::reset` | 清理历史状态，定义首次计算的初始化方式 |
 | `Pid::calculate` | 使用时间间隔计算 PID，处理积分与输出限制 |
-| `Control`、`Default` | 配置两轴、各自双环 PID、角度目标、反馈年龄、故障记录等 |
+| `Control`、`Default` | 配置两轴电机槽位、PID 参数、反馈年龄、故障记录等 |
 | `Control::update_mode` | 完整的判断、切换和进入／退出处理 |
 | `Control::update` | 回正、遥控双环控制及禁止输出状态下的具体行为 |
 | `Motor::read`、`Motor::transmit` | 根据电机手册完成解码、换算、限幅与编码 |
@@ -350,25 +355,27 @@ cargo run --release --locked
 
 确认固件运行后，在终端按 Ctrl+C 退出 probe-rs 日志会话，释放调试探针。此操作不等于 disable，操作电机仍使用右上拨杆。VS Code 调试器和 Tuning Studio 也不能同时占用同一个探针。
 
-### 3. 连接示波界面
+### 3. 连接并画曲线
 
-1. 打开 VS Code 左侧的 Tuning Studio，或命令面板执行 `Tuning Studio: Open Firmware ELF…`。
-2. 选择本次烧录对应的 `target/thumbv7em-none-eabihf/release/control-training-template`。这是不带扩展名的固件文件，不是 `.rs` 源码。不要选择旧编译结果。
-3. 执行 `Tuning Studio: Connect Target…`，选择 SWD 调试探针和芯片 `STM32H723VGTx`。本次模板没有接入 USB 示波协议，因此先使用探针连接。
-4. 在 Symbols 中展开助教提供的观测变量，对数值字段使用 `Plot Symbol`，再用 `Tuning Studio: Open Scope` 打开曲线。
-5. 首先可按插件默认的 100 Hz 采样观察。控制循环仍为 1 kHz，曲线采样率不是控制频率；较慢采样不能证明没有高频抖动。
-6. 要保存实验，使用 `Start Recording`／`Stop Recording`，按照插件界面保存记录。重新烧录后，先断开，再重新打开对应 ELF 并连接。
+本节按 0.1.2 之后的新版面板编写。插件市场暂时仍是 0.1.2，界面不同，请向助教获取新版安装包。
 
-### 4. 找不到观测变量怎么办？
+1. 命令面板执行 `Tuning Studio: Open Scope`，打开 Tuning Scope 面板。
+2. 点击面板左上角 **Open firmware…**，选择本次烧录对应的 `target/thumbv7em-none-eabihf/release/control-training-template`。这是不带扩展名的固件文件，不是 `.rs` 源码。不要选择旧编译结果。
+3. 点击右上角 **Connect…**，选择 SWD 调试探针和芯片 `STM32H723VGTx`。
+4. 左侧 Live Watch 中展开 **Tasks → control_task → control**，里面是 `Control` 的全部字段，例如 `motors`、`angle_pid`、`state`。顶部输入框可按名称筛选。
+5. 点击数值右侧的方块，把该字段加入右侧曲线；再点一次取消。
+6. 工具栏可选择 2、5、10、30 s 时间窗口，**Pause** 暂停画面，**Record** 开始记录到工程的 `.tuning-studio/recordings/`，再点一次停止。
 
-当前模板还没有专门的示波观测接口，任务内局部变量在优化后不一定能稳定定位。请先由助教确认可用的观测变量，再按上面的步骤绘图；安装插件本身不会自动添加固件观测接口。不要为看曲线把控制对象改成不安全的全局共享变量。
+默认采样率为 100 Hz，可用 `Tuning Studio: Change Sample Rate…` 修改。控制循环仍为 1 kHz，曲线采样率不是控制频率；较慢采样不能证明没有高频抖动。
+
+### 4. 注意事项
+
+- 采样期间不会暂停芯片，但每次连接和断开会让芯片暂停约 20 ms。期间漏掉的控制周期之后会连续补跑，所以只在两轴取消输出时连接或断开。
+- 重新烧录前先点 **Disconnect**，烧录后再点 **Connect…**。重新编译过的固件，用 `Tuning Studio: Open Firmware ELF…` 重新打开对应 ELF。
+- `control` 需要保持为 `control_task` 中的局部变量，任务中只保留一个 `.await`（`ticker.next().await`）。把它移到别处，或在任务里增加其他 `.await`，可能导致字段无法绘图或读到错误数据。不要为看曲线把控制对象改成全局共享变量。
 
 ## 六、提交内容
 
 在平台上提交自己的 **GitHub 作业仓库链接**即可，不需要额外上传报告、ZIP 或演示视频。
 
 完成代码后，带电脑和准备好的代码来实验室，使用云台教具进行现场调试与验收。来之前先确认工程能够编译，代码已 commit 并 push 到自己的仓库。
-
----
-
-开发板接线、看门狗与复位行为等底层信息见 [硬件说明](docs/HARDWARE_NOTES.md)。

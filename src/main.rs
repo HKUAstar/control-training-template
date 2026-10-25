@@ -9,92 +9,106 @@ use embassy_executor::Spawner;
 use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Ticker};
 
-// GM6020 电流模式下 ID 1～4 的组指令。
-// 同时限定每周期 CAN 接收数量和遥控输入的超时周期数。
+// GM6020 current-mode group command for motor IDs 1 to 4.
 const MOTOR_COMMAND_ID: u16 = 0x1FE;
+// CAN frames read per tick, and ticks without remote input before it counts as lost.
 const MAX_RX_FRAMES_PER_TICK: usize = 8;
 const REMOTE_SILENT_TICKS: u16 = 100;
 
-// 保存一个电机的角度、转速和电流反馈，以及速度目标和电流指令。
-// 字段使用 rad、rpm、A；与 CAN 原始数值之间的换算由编解码函数完成。
+/// Feedback, targets and command for one motor.
+/// `Motor::read` and `Motor::transmit` convert between these fields and CAN values.
 #[derive(Clone, Copy, Default)]
 pub struct Motor {
-    /// 电机轴单圈角度（rad），尚未累计圈数。
+    /// Single-turn motor shaft angle in rad; turns are not counted.
     pub angle_rad: f32,
     pub speed_rpm: f32,
-    pub current_a: f32,
+    /// Feedback current as sent on the wire. The motor manual gives no scale to amperes.
+    pub current_raw: i16,
+    /// Angle loop target in rad.
+    pub target_angle_rad: f32,
+    /// Speed loop target in rpm, set by the angle loop output.
     pub target_rpm: f32,
-    /// 待编码发送的电流指令（A）。
+    /// Current command in A, encoded by `Motor::transmit`.
     pub command_current_a: f32,
 }
 
 impl Motor {
-    /// 仅清零内存，不发送 CAN 帧。
-    // 清零本电机的目标速度和电流指令，只修改内存。
-    // 仍需经过发送阶段，电机才能收到零指令。
+    /// Clear the speed target and current command in RAM. This sends no CAN frame;
+    /// the motor receives zero only when `Control::transmit` next runs.
     pub fn disable(&mut self) {
         self.target_rpm = 0.0;
         self.command_current_a = 0.0;
     }
 
     pub fn read(&mut self, _data: &[u8; 8]) {
-        // 待补全：按手册解码角度、转速和电流。
+        // TODO: decode angle, speed and current as the manual describes.
         todo!("Decode motor feedback");
     }
 
-    /// 打包 ID 1～4 的指令；None 槽位填零。
+    /// Pack the commands for motor IDs 1 to 4. `None` slots encode zero.
     pub fn transmit(_motors: &[Option<Motor>; 4]) -> [u8; 8] {
-        // 待补全：限幅、换算并打包电流指令，None 槽位填零。
+        // TODO: limit, convert and pack each current command.
         todo!("Encode the four motor commands");
     }
 }
 
-// PID 控制器保存参数及跨周期使用的积分和历史数据。
-// 待补全：增益、历史状态、积分限制和输出限制。
+/// PID gains, plus the integral and history kept between ticks.
+// TODO: add gains, history, an integral limit and a symmetric output limit `maxout`.
 pub struct Pid {}
 
 impl Pid {
-    // 待补全：清除 PID 历史状态。
+    // TODO: clear the integral and history.
     pub fn reset(&mut self) {
         todo!("Clear PID history");
     }
 
-    /// 单位由调用处约定：速度环 rpm → A，角度环 rad → rpm；dt_s 为秒。
+    /// `target` and `measured` share a unit, set by the caller. The angle loop takes rad
+    /// and returns rpm; the speed loop takes rpm and returns A. `dt_s` is in seconds.
+    /// If an angle loop returns rad/s, convert it to rpm before passing it to the speed loop.
     pub fn calculate(&mut self, _target: f32, _measured: f32, _dt_s: f32) -> f32 {
-        // 待补全：使用 dt_s 计算 PID，并限制积分和输出。
+        // TODO: compute the PID with dt_s, and limit the integral and output.
         todo!("Implement PID");
     }
 }
 
-// 记录云台当前所处阶段，决定允许的操作和控制输出。
-// 本次分别对应等待、回正、遥控调试和故障恢复。
+/// The gimbal's stage, which decides the allowed operations and outputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
+    /// Zero output. Waits for valid remote input and fresh feedback from both motors,
+    /// then for a new enable request.
     Waiting,
+    /// Recenters both axes to the reference pose with limited speed and output.
+    /// Enters `Running` once both axes settle.
     Prepare,
+    /// The left stick moves the target angles, and each axis's cascade tracks them.
     Running,
+    /// Zero output until a manual recovery.
     Error,
 }
 
-// 汇总状态、电机和遥控输入，供每个控制周期共同使用。
-// 待补全：两轴独立的双环 PID、目标角度、反馈年龄和故障记录。
+/// State shared by every control tick.
+// TODO: add feedback ages and a fault record.
 pub struct Control {
     pub state: State,
-    /// 槽位依次对应电机 ID 1～4。
+    /// Slots hold motor IDs 1 to 4.
     pub motors: [Option<Motor>; 4],
-    pub pid: Pid,
+    /// Angle loop for each motor slot: rad in, rpm out.
+    pub angle_pid: [Pid; 4],
+    /// Speed loop for each motor slot: rpm in, A out.
+    pub speed_pid: [Pid; 4],
     pub remote: Option<dm_mc02::Dr16>,
     remote_silent_ticks: u16,
 }
 
-// 设置上电初值：进入 Waiting，电机槽位和遥控输入尚未就绪。
-// 添加成员后，也需要在这里设置对应的初始值。
+/// Start in `Waiting` with no motors and no remote input.
+/// Set the initial value of each field you add here.
 impl Default for Control {
     fn default() -> Self {
         Self {
             state: State::Waiting,
             motors: [None; 4],
-            pid: Pid {},
+            angle_pid: [const { Pid {} }; 4],
+            speed_pid: [const { Pid {} }; 4],
             remote: None,
             remote_silent_ticks: REMOTE_SILENT_TICKS,
         }
@@ -102,16 +116,15 @@ impl Default for Control {
 }
 
 impl Control {
-    // 对所有 Some 电机调用 disable，未配置的槽位直接跳过。
-    // 本函数只清除软件指令，不调用 PID，也不直接发送 CAN 帧。
+    /// Disable every configured motor. This only clears commands in RAM.
     pub fn disable_all(&mut self) {
         for motor in self.motors.iter_mut().flatten() {
             motor.disable();
         }
     }
 
-    // 每 1 ms 执行一次：读取遥控器和电机反馈，再判断状态、计算并发送输出。
-    // 遥控输入无效时强制回到 Waiting，避免继续执行运行状态的控制。
+    /// Runs every 1 ms: read the remote and motor feedback, update the state, then
+    /// compute and send the outputs. Missing remote input forces `Waiting`.
     pub fn tick(&mut self, can: &mut Can1) {
         self.read_remote();
         self.read_feedback(can);
@@ -123,8 +136,8 @@ impl Control {
         self.transmit(can);
     }
 
-    // 取走接收任务发布的最新遥控输入，没有新帧时继续累计反馈年龄。
-    // 输入无效或超过超时周期后，清除电机指令并返回 Waiting。
+    /// Take the latest input published by the remote task. After an invalid frame, or
+    /// `REMOTE_SILENT_TICKS` ticks without one, clear the motor commands and return to `Waiting`.
     pub fn read_remote(&mut self) {
         self.remote_silent_ticks = self.remote_silent_ticks.saturating_add(1);
         if let Some(remote) = dm_mc02::REMOTE.try_take() {
@@ -142,49 +155,51 @@ impl Control {
         }
     }
 
-    // 从 CAN 接收队列取出已有帧，每周期最多处理指定数量，不等待新帧。
-    // 需要将匹配帧交给对应电机解码，并记录各电机最近收到反馈的时间。
+    /// Read up to `MAX_RX_FRAMES_PER_TICK` queued CAN frames without waiting for more.
     pub fn read_feedback(&mut self, can: &mut Can1) {
         let receiver = can.reader();
         for _ in 0..MAX_RX_FRAMES_PER_TICK {
             let Ok(Ok(envelope)) = receiver.try_receive() else {
                 break;
             };
-            // 待补全：筛选 ID 和长度、路由并解码，记录反馈年龄。
+            // TODO: check the ID and length, pass the data to the matching motor's
+            // `Motor::read`, and record its feedback age.
             let _frame = envelope.frame;
         }
     }
 
-    // 根据遥控操作、反馈有效性和故障条件决定当前状态。
-    // 待补全：切换判断，以及进入、退出状态时的目标和 PID 初始化。
+    /// Choose the state from the remote, feedback and fault conditions.
+    // TODO: the transitions, and initialising targets and PIDs on entering a state.
     pub fn update_mode(&mut self) {
         match self.state {
             State::Waiting => {
-                // 待补全：有效反馈和新的使能操作满足后进入回正。
+                // TODO: enter Prepare after valid feedback and a new enable request.
             }
             State::Prepare => {
-                // 待补全：初始化目标与 PID，稳定回正后进入调试。
+                // TODO: enter Running once recentering settles; stop on a timeout or fault.
             }
             State::Running => {
-                // 待补全：判断停用、反馈超时和控制故障。
+                // TODO: handle disable, feedback timeouts and control faults.
             }
             State::Error => {
-                // 待补全：保持零输出，自行设计人工恢复条件。
+                // TODO: keep zero output until your manual recovery condition.
             }
         }
     }
 
-    // 根据当前状态设置目标，调用各轴 PID，并写入电流指令。
-    // 待补全：受限回正、遥控双环和禁止输出时的行为；PID 周期为 0.001 s。
+    /// Set targets for the current state, run each axis's PIDs and write the current commands.
+    // TODO: limited recentering, remote cascade control, and zero output elsewhere.
+    // Each tick is 0.001 s.
     pub fn update(&mut self) {}
 
-    // 将四个槽位的电流指令打包为组控制帧，通过 CAN1 非阻塞发送。
-    // 未配置任何电机时不发送；发送队列满会触发 panic 和复位锁定。
+    /// Encode the four current commands into one group frame and queue it on CAN1
+    /// without waiting. Sends nothing while no motor is configured. A full transmit
+    /// queue panics, which leads to the watchdog reset lockout.
     pub fn transmit(&mut self, can: &mut Can1) {
         if self.motors.iter().all(Option::is_none) {
             return;
         }
-        // 仅允许回正或调试状态输出，且遥控输入必须有效。
+        // Only Prepare and Running may drive the motors, and only with valid remote input.
         if self.remote.is_none() || !matches!(self.state, State::Prepare | State::Running) {
             self.disable_all();
         }
@@ -196,8 +211,8 @@ impl Control {
     }
 }
 
-// 固件入口：初始化 RTT 日志、开发板和通信接口，再启动两个异步任务。
-// 遥控任务接收输入，控制任务持有 CAN 和看门狗并持续运行。
+// Firmware entry: set up RTT, the board and its interfaces, then start both tasks.
+// The remote task receives input; the control task owns CAN and the watchdog.
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     rtt_target::rtt_init_print!(rtt_target::ChannelMode::NoBlockTrim, 1024);
@@ -207,8 +222,8 @@ async fn main(spawner: Spawner) {
     spawner.spawn(control_task(can, watchdog).unwrap());
 }
 
-// 用 Ticker 安排 1 kHz 控制周期，调用 tick 完成一次控制后再喂狗。
-// 每次 tick 应在 1 ms 内完成；卡住而不能喂狗时，由看门狗触发复位。
+// Run `tick` at 1 kHz and feed the watchdog after each one. A tick must finish
+// within 1 ms; if it hangs, the watchdog resets the MCU.
 #[embassy_executor::task]
 async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
     let mut control = Control::default();
