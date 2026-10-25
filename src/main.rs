@@ -15,7 +15,7 @@ const MOTOR_COMMAND_ID: u16 = 0x1FE;
 const MAX_RX_FRAMES_PER_TICK: usize = 8;
 const REMOTE_SILENT_TICKS: u16 = 100;
 
-/// Feedback, targets and command for one motor.
+/// Feedback and current command for one motor.
 /// `Motor::read` and `Motor::transmit` convert between these fields and CAN values.
 #[derive(Clone, Copy, Default)]
 pub struct Motor {
@@ -24,19 +24,14 @@ pub struct Motor {
     pub speed_rpm: f32,
     /// Feedback current as sent on the wire. The motor manual gives no scale to amperes.
     pub current_raw: i16,
-    /// Angle loop target in rad.
-    pub target_angle_rad: f32,
-    /// Speed loop target in rpm, set by the angle loop output.
-    pub target_rpm: f32,
     /// Current command in A, encoded by `Motor::transmit`.
     pub command_current_a: f32,
 }
 
 impl Motor {
-    /// Clear the speed target and current command in RAM. This sends no CAN frame;
+    /// Clear the current command in RAM. This sends no CAN frame;
     /// the motor receives zero only when `Control::transmit` next runs.
     pub fn disable(&mut self) {
-        self.target_rpm = 0.0;
         self.command_current_a = 0.0;
     }
 
@@ -62,9 +57,9 @@ impl Pid {
         todo!("Clear PID history");
     }
 
-    /// `target` and `measured` share a unit, set by the caller. The angle loop takes rad
+    /// `target` and `measured` share a unit, set by the caller. The position loop takes rad
     /// and returns rpm; the speed loop takes rpm and returns A. `dt_s` is in seconds.
-    /// If an angle loop returns rad/s, convert it to rpm before passing it to the speed loop.
+    /// If a position loop returns rad/s, convert it to rpm before passing it to the speed loop.
     pub fn calculate(&mut self, _target: f32, _measured: f32, _dt_s: f32) -> f32 {
         // TODO: compute the PID with dt_s, and limit the integral and output.
         todo!("Implement PID");
@@ -80,10 +75,36 @@ pub enum State {
     /// Recenters both axes to the reference pose with limited speed and output.
     /// Enters `Running` once both axes settle.
     Prepare,
-    /// The left stick moves the target angles, and each axis's cascade tracks them.
+    /// The left stick moves each axis's `target_angle_rad`, and its cascade tracks it.
     Running,
     /// Zero output until a manual recovery.
     Error,
+}
+
+/// One gimbal axis: its motor slot, targets and cascaded PIDs.
+pub struct Axis {
+    /// Index into `Control::motors`, which is the motor ID minus 1.
+    pub slot: usize,
+    /// Position loop target in rad.
+    pub target_angle_rad: f32,
+    /// Speed loop target in rpm, set from the position loop output.
+    pub target_rpm: f32,
+    /// Position loop: rad in, rpm out.
+    pub position_pid: Pid,
+    /// Speed loop: rpm in, A out.
+    pub speed_pid: Pid,
+}
+
+impl Axis {
+    pub const fn new(slot: usize) -> Self {
+        Self {
+            slot,
+            target_angle_rad: 0.0,
+            target_rpm: 0.0,
+            position_pid: Pid {},
+            speed_pid: Pid {},
+        }
+    }
 }
 
 /// State shared by every control tick.
@@ -92,10 +113,8 @@ pub struct Control {
     pub state: State,
     /// Slots hold motor IDs 1 to 4.
     pub motors: [Option<Motor>; 4],
-    /// Angle loop for each motor slot: rad in, rpm out.
-    pub angle_pid: [Pid; 4],
-    /// Speed loop for each motor slot: rpm in, A out.
-    pub speed_pid: [Pid; 4],
+    pub yaw: Axis,
+    pub pitch: Axis,
     pub remote: Option<dm_mc02::Dr16>,
     remote_silent_ticks: u16,
 }
@@ -107,8 +126,9 @@ impl Default for Control {
         Self {
             state: State::Waiting,
             motors: [None; 4],
-            angle_pid: [const { Pid {} }; 4],
-            speed_pid: [const { Pid {} }; 4],
+            // TODO: use the motor IDs from the rig configuration.
+            yaw: Axis::new(0),
+            pitch: Axis::new(1),
             remote: None,
             remote_silent_ticks: REMOTE_SILENT_TICKS,
         }

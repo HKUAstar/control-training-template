@@ -94,15 +94,13 @@ self.transmit(can);      // 把计算结果真正发给电机
 
 ### 4. 电机变量分别是什么？
 
-模板里的 `Motor` 保存一个电机的反馈、目标和输出：
+模板里的 `Motor` 保存一个电机的反馈和电流指令：
 
 ```rust
 pub struct Motor {
     pub angle_rad: f32,
     pub speed_rpm: f32,
     pub current_raw: i16,
-    pub target_angle_rad: f32,
-    pub target_rpm: f32,
     pub command_current_a: f32,
 }
 ```
@@ -112,8 +110,6 @@ pub struct Motor {
 | `angle_rad` | 当前电机轴角度 | rad；模板尚未实现多圈累计 |
 | `speed_rpm` | 当前电机轴转速 | rpm |
 | `current_raw` | 反馈电流 | 协议原始值；手册未给出换算到 A 的比例 |
-| `target_angle_rad` | 希望达到的电机轴角度 | rad；是角度环目标 |
-| `target_rpm` | 希望达到的电机轴转速 | rpm；是速度环目标，由角度环输出给出 |
 | `command_current_a` | 控制器计算的电流指令 | A；发送前还要换算成协议数值 |
 
 例如，在已经取得有效电机对象后，可以这样访问字段：
@@ -121,11 +117,30 @@ pub struct Motor {
 ```rust
 let angle = motor.angle_rad;
 let speed = motor.speed_rpm;
-motor.target_rpm = 0.0;
 motor.command_current_a = 0.0;
 ```
 
-`motors` 的类型是 `[Option<Motor>; 4]`，四个槽位对应电机 ID 1～4。`Some(...)` 表示配置了电机，`None` 表示该槽位未使用。模板初始为 `[None; 4]`，**不能把下标直接当成 yaw 或 pitch**；实际 ID 与两轴的对应关系由教具配置指定。
+`motors` 的类型是 `[Option<Motor>; 4]`，四个槽位对应电机 ID 1～4。`Some(...)` 表示配置了电机，`None` 表示该槽位未使用。模板初始为 `[None; 4]`。
+
+两轴的目标和 PID 放在 `Control` 的 `yaw`、`pitch` 中，类型为 `Axis`：
+
+```rust
+pub struct Axis {
+    pub slot: usize,
+    pub target_angle_rad: f32,
+    pub target_rpm: f32,
+    pub position_pid: Pid,
+    pub speed_pid: Pid,
+}
+```
+
+| 字段 | 含义 | 单位／注意事项 |
+|---|---|---|
+| `slot` | 该轴电机在 `motors` 中的下标 | 电机 ID 减 1；模板默认 yaw 为 0、pitch 为 1，需按教具配置修改 |
+| `target_angle_rad` | 希望达到的角度 | rad；是位置环目标 |
+| `target_rpm` | 希望达到的电机轴转速 | rpm；是速度环目标，由位置环输出给出 |
+| `position_pid` | 位置环 | 输入 rad，输出 rpm |
+| `speed_pid` | 速度环 | 输入 rpm，输出 A |
 
 ### 5. 电机指令怎样发出去？
 
@@ -141,7 +156,7 @@ pub fn transmit(_motors: &[Option<Motor>; 4]) -> [u8; 8]
 已有停止接口：
 
 ```rust
-motor.disable();   // 清除这个电机的目标速度和电流指令
+motor.disable();   // 清除这个电机的电流指令
 self.disable_all(); // 在 Control 内清除全部已配置电机的指令
 ```
 
@@ -225,14 +240,7 @@ impl Pid {
 
 上面是接口节选，不是完整实现。速度环输入为 rpm，输出为 A，每次调用的 `dt_s` 为 `0.001`。你需要添加增益、积分、历史数据和限制，并完成 `reset`、`calculate`。
 
-双环的连接为：`target_angle_rad` 交给角度环，角度环给出 `target_rpm`，再交给速度环，最后得到 `command_current_a`。`Control` 已为每个电机槽位准备了各自的 PID：
-
-```rust
-pub angle_pid: [Pid; 4], // 角度环：输入 rad，输出 rpm
-pub speed_pid: [Pid; 4], // 速度环：输入 rpm，输出 A
-```
-
-下标与 `motors` 相同。yaw 和 pitch 使用各自槽位的 PID，不能共用同一个实例。若角度环输出 rad/s，先换算成 rpm 再接速度环。
+双环的连接为：`Axis::target_angle_rad` 交给 `position_pid`，它的输出写入 `target_rpm`，再交给 `speed_pid`，最后得到该轴电机的 `command_current_a`。`yaw`、`pitch` 各有一组 PID，历史状态互不影响。若位置环输出 rad/s，先换算成 rpm 再接速度环。
 
 ### 9. 状态机是什么？
 
@@ -291,9 +299,9 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 
 `Running` 下，左摇杆左右控制 yaw、上下控制 pitch，双环 PID 让两轴跟随目标。松手后保持目标角度，右上拨杆下拨则取消输出。
 
-调速度环时，把角度环输出限幅 `maxout` 设为 `0`，使角度环输出的目标速度始终为零，再调整速度环参数。PID 的最终输出必须对称限制在 `[-maxout, maxout]`，这样 `maxout = 0` 才确实得到零输出。`maxout` 是本次需要添加的参数，模板尚未定义该字段。
+调速度环时，把位置环输出限幅 `maxout` 设为 `0`，使位置环输出的目标速度始终为零，再调整速度环参数。PID 的最终输出必须对称限制在 `[-maxout, maxout]`，这样 `maxout = 0` 才确实得到零输出。`maxout` 是本次需要添加的参数，模板尚未定义该字段。
 
-重新调角度环时恢复合理的角度环 `maxout`，再从小增加角度环 Kp。修改前先 disable，重新初始化目标和 PID 历史；不要求在线修改参数。
+重新调位置环时恢复合理的位置环 `maxout`，再从小增加位置环 Kp。修改前先 disable，重新初始化目标和 PID 历史；不要求在线修改参数。
 
 ### 4. 故障：先停止，再让人处理
 
@@ -315,7 +323,7 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 | `Pid` | 添加参数、积分、历史数据及限制 |
 | `Pid::reset` | 清理历史状态，定义首次计算的初始化方式 |
 | `Pid::calculate` | 使用时间间隔计算 PID，处理积分与输出限制 |
-| `Control`、`Default` | 配置两轴电机槽位、PID 参数、反馈年龄、故障记录等 |
+| `Control`、`Default` | 设置两轴的 `slot` 和 PID 参数，添加反馈年龄、故障记录等 |
 | `Control::update_mode` | 完整的判断、切换和进入／退出处理 |
 | `Control::update` | 回正、遥控双环控制及禁止输出状态下的具体行为 |
 | `Motor::read`、`Motor::transmit` | 根据电机手册完成解码、换算、限幅与编码 |
@@ -330,8 +338,8 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 
 1. **先看反馈。** 先不使能电机，确认两轴对应正确，手动改变姿态时角度和速度方向符合说明。准备好停止操作。
 2. **确认闭环方向。** 在低输出限制下检查输出方向，确认负反馈后再逐渐调参。
-3. **单独调速度环。** 将角度环 `maxout` 设为 `0`，确认目标速度为零；速度环积分和微分先设为零，从小增加速度环 Kp。在允许施加轻微扰动的位置操作，感受抵抗转动的变化，记录速度和电流曲线。Kp 过大可能抖动。零速度环抵抗运动，但不保证回到原角度。
-4. **再调角度环。** 保持稳定的速度环参数，恢复合理的角度环 `maxout`，从小增加角度环 Kp，给出小幅目标变化，观察跟踪快慢、超调，以及目标／实际速度。根据结果决定是否需要其他项，一次只改少量参数。
+3. **单独调速度环。** 将位置环 `maxout` 设为 `0`，确认目标速度为零；速度环积分和微分先设为零，从小增加速度环 Kp。在允许施加轻微扰动的位置操作，感受抵抗转动的变化，记录速度和电流曲线。Kp 过大可能抖动。零速度环抵抗运动，但不保证回到原角度。
+4. **再调位置环。** 保持稳定的速度环参数，恢复合理的位置环 `maxout`，从小增加位置环 Kp，给出小幅目标变化，观察跟踪快慢、超调，以及目标／实际速度。根据结果决定是否需要其他项，一次只改少量参数。
 5. **检查模式切换。** 验证启动回正、遥控、停止、故障和恢复，观察切换瞬间有没有突然运动。
 
 ## 五、怎样实时看参数和曲线？
@@ -357,22 +365,16 @@ cargo run --release --locked
 
 ### 3. 连接并画曲线
 
-本节按 0.1.2 之后的新版面板编写。插件市场暂时仍是 0.1.2，界面不同，请向助教获取新版安装包。
+本节按 Tuning Studio 0.1.3 编写，更早的版本界面不同。
 
 1. 命令面板执行 `Tuning Studio: Open Scope`，打开 Tuning Scope 面板。
 2. 点击面板左上角 **Open firmware…**，选择本次烧录对应的 `target/thumbv7em-none-eabihf/release/control-training-template`。这是不带扩展名的固件文件，不是 `.rs` 源码。不要选择旧编译结果。
 3. 点击右上角 **Connect…**，选择 SWD 调试探针和芯片 `STM32H723VGTx`。
-4. 左侧 Live Watch 中展开 **Tasks → control_task → control**，里面是 `Control` 的全部字段，例如 `motors`、`angle_pid`、`state`。顶部输入框可按名称筛选。
+4. 左侧 Live Watch 中展开 **Tasks → control_task → control**，里面是 `Control` 的全部字段，例如 `motors`、`yaw`、`state`。顶部输入框可按名称筛选。
 5. 点击数值右侧的方块，把该字段加入右侧曲线；再点一次取消。
 6. 工具栏可选择 2、5、10、30 s 时间窗口，**Pause** 暂停画面，**Record** 开始记录到工程的 `.tuning-studio/recordings/`，再点一次停止。
 
 默认采样率为 100 Hz，可用 `Tuning Studio: Change Sample Rate…` 修改。控制循环仍为 1 kHz，曲线采样率不是控制频率；较慢采样不能证明没有高频抖动。
-
-### 4. 注意事项
-
-- 采样期间不会暂停芯片，但每次连接和断开会让芯片暂停约 20 ms。期间漏掉的控制周期之后会连续补跑，所以只在两轴取消输出时连接或断开。
-- 重新烧录前先点 **Disconnect**，烧录后再点 **Connect…**。重新编译过的固件，用 `Tuning Studio: Open Firmware ELF…` 重新打开对应 ELF。
-- `control` 需要保持为 `control_task` 中的局部变量，任务中只保留一个 `.await`（`ticker.next().await`）。把它移到别处，或在任务里增加其他 `.await`，可能导致字段无法绘图或读到错误数据。不要为看曲线把控制对象改成全局共享变量。
 
 ## 六、提交内容
 
