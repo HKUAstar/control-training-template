@@ -6,7 +6,7 @@ and sends no motor commands.
 
 There are two source files:
 
-- `src/dm_mc02.rs`: clocks, CAN1, watchdog, and panic handling.
+- `src/dm_mc02.rs`: clocks, CAN1, DR16 reception, watchdog, and panic handling.
 - `src/main.rs`: entry point, RTT, 1 kHz control task, and exercises.
 
 ## Build and run
@@ -26,6 +26,44 @@ CAN1 uses PD0 for RX and PD1 for TX, with classic CAN at 1 Mbit/s. The CPU uses 
 64 MHz HSI. CAN uses the board's 24 MHz crystal with a 75% sample point. No PLL is configured.
 Power the board through USB or its normal input; probe power alone does not power its CAN
 transceivers. Connect CAN ground and terminate both ends of the bus with 120 ohms.
+
+## DR16 remote input
+
+Connect the DR16 to the board's DBUS port: UART5 RX on PD2, using DMA1 channel 5 at 100 kbaud,
+8 data bits, even parity, and 2 stop bits. The board provides signal inversion; do not enable
+software inversion. Initialization enables the board's switched 5 V output on PC15.
+
+将 DR16 接到开发板的 DBUS 接口，UART5 的 PD2 引脚接收，使用 DMA1 通道 5。
+串口配置为 100 kbaud、8 位数据、偶校验、2 位停止位。板载电路已反相，无需软件再次反相。
+初始化时会开启 PC15 控制的 5 V 输出。
+
+The receiver task waits for UART idle and accepts exactly one valid 18-byte frame. It publishes
+only the latest decoded input, without blocking the control task. `self.remote` is `Some(Dr16)`
+while input is valid, or `None` before reception, after an invalid frame/UART error, or after
+100 control ticks without a valid frame. Missing input clears motor commands and forces `Waiting`.
+Remote recovery does not enable motors automatically; implement the explicit enable condition.
+
+接收任务等待 UART 空闲间隔，只接受完整有效的 18 字节帧，并只发布最新遥控输入。
+有效时 `self.remote` 为 `Some(Dr16)`；未接收到数据、收到无效帧或串口错误，
+以及连续 100 个控制周期没有有效帧时为 `None`。遥控输入缺失会清除电机指令并返回 `Waiting`。
+遥控恢复后不会自动使能电机，请在模式切换练习中实现明确的使能条件。
+
+`remote.channels` contains right horizontal, right vertical, left horizontal, left vertical, and
+wheel counts, centered at zero in `-660..=660`. Divide by `660.0` for a normalized value and add
+a deadzone as needed. Both switches use wire values: 1 up, 2 down, 3 middle. Mouse deltas, mouse
+buttons, and keyboard bits are also available. No axis remapping or automatic target assignment
+is applied. For example, use `remote.channels[1]` in `update` to choose a speed target.
+
+`remote.channels` 依次为右横、右纵、左横、左纵和拨轮，中心为 0，范围为 `-660..=660`。
+除以 `660.0` 可归一化，按需添加死区。两开关的值为 1 上、2 下、3 中。
+还提供鼠标位移、鼠标按键和键盘位图。模板不自动变换坐标或设置目标值。
+例如，在 `update` 中使用 `remote.channels[1]` 设置速度目标。
+
+This is a basic idle-framed receiver, without a CRC or a stream resynchronizer. UART framing,
+receiver power, channel directions, and disconnect behavior have not been tested on hardware.
+
+这是按空闲间隔分帧的基础接收实现，不包含 CRC 或字节流重同步器。
+串口分帧、接收机供电、通道方向和断线行为尚未经过硬件测试。
 
 ## Exercises
 
@@ -49,9 +87,9 @@ transceivers. Connect CAN ground and terminate both ends of the bus with 120 ohm
 5. Implement `Control::update` to calculate current commands. Keep outputs zero outside `Running`
    and for motors with missing feedback.
 
-Each tick calls `read_feedback`, `update_mode`, `update`, then `transmit`. With all motor slots
+Each tick calls `read_remote`, `read_feedback`, `update_mode`, `update`, then `transmit`. With all motor slots
 set to `None`, startup stays runnable. Section comments provide instructions in English and Chinese.
-每个周期依次读取反馈、更新模式、计算控制量并发送指令。所有电机槽位初始为 `None`，便于直接运行。
+每个周期依次读取遥控输入和电机反馈、更新模式、计算控制量并发送指令。所有电机槽位初始为 `None`，便于直接运行。
 代码分区注释提供中英文练习说明。
 
 The `todo!()` functions panic if called. With no motors configured, the starter does not call them.
@@ -117,3 +155,7 @@ and
 
 Watchdog/reset reference:
 [STM32H723 reference manual RM0468](https://www.st.com/resource/en/reference_manual/dm00603761.pdf).
+
+DR16 protocol: [DJI DT7/DR16 manual][dr16-manual].
+
+[dr16-manual]: https://cdn-hz.robomaster.com/tem/09f88aafe7ae51516874829340553427.pdf

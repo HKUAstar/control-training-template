@@ -13,6 +13,7 @@ use embassy_time::{Duration, Ticker};
 // GM6020 电流模式下电机 1 至 4 的组指令 ID，使用其他协议时请修改。
 const MOTOR_COMMAND_ID: u16 = 0x1FE;
 const MAX_RX_FRAMES_PER_TICK: usize = 8;
+const REMOTE_SILENT_TICKS: u16 = 100;
 
 // ========= Motor feedback and commands / 电机反馈与指令 =========
 // Implement the wire protocol here. Keep physical values in the units shown below.
@@ -98,6 +99,8 @@ pub struct Control {
     /// Array slots correspond to motor IDs 1 through 4.
     pub motors: [Option<Motor>; 4],
     pub pid: Pid,
+    pub remote: Option<dm_mc02::Dr16>,
+    remote_silent_ticks: u16,
 }
 
 impl Default for Control {
@@ -106,6 +109,8 @@ impl Default for Control {
             state: State::Waiting,
             motors: [None; 4],
             pid: Pid {},
+            remote: None,
+            remote_silent_ticks: REMOTE_SILENT_TICKS,
         }
     }
 }
@@ -126,10 +131,34 @@ impl Control {
     // Run every 1 ms. Check feedback and mode before calculating or sending commands.
     // 每 1 ms 执行一次，先检查反馈和模式，再计算和发送指令。
     pub fn tick(&mut self, can: &mut Can1) {
+        self.read_remote();
         self.read_feedback(can);
         self.update_mode();
+        if self.remote.is_none() {
+            self.state = State::Waiting;
+        }
         self.update();
         self.transmit(can);
+    }
+
+    // ========= Remote input / 遥控输入 =========
+    // Use self.remote in update_mode and update; stick values are centered receiver counts.
+    // 在 update_mode 和 update 中使用 self.remote，摇杆值为中心归零的接收机计数。
+    pub fn read_remote(&mut self) {
+        self.remote_silent_ticks = self.remote_silent_ticks.saturating_add(1);
+        if let Some(remote) = dm_mc02::REMOTE.try_take() {
+            self.remote = remote;
+            if self.remote.is_some() {
+                self.remote_silent_ticks = 0;
+            }
+        }
+        if self.remote_silent_ticks >= REMOTE_SILENT_TICKS {
+            self.remote = None;
+        }
+        if self.remote.is_none() {
+            self.disable_all();
+            self.state = State::Waiting;
+        }
     }
 
     // ========= Read feedback / 读取反馈 =========
@@ -222,8 +251,9 @@ impl Control {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     rtt_target::rtt_init_print!(rtt_target::ChannelMode::NoBlockTrim, 1024);
-    let (can, watchdog) = dm_mc02::init();
+    let (can, watchdog, remote) = dm_mc02::init();
     rtt_target::rprintln!("change me");
+    spawner.spawn(dm_mc02::remote_task(remote).unwrap());
     spawner.spawn(control_task(can, watchdog).unwrap());
 }
 

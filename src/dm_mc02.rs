@@ -3,6 +3,8 @@
 //!
 //! The CPU uses 64 MHz HSI; CAN1 uses the board's 24 MHz HSE crystal on PD0/PD1.
 //! CPU 使用 64 MHz HSI 内部时钟；CAN1 使用板载 24 MHz HSE 晶振，引脚为 PD0/PD1。
+//! UART5 receives DR16 DBUS through the board inverter on PD2.
+//! UART5 通过 PD2 上的板载反相电路接收 DR16 DBUS。
 //! TIM2 provides Embassy's time driver, so keep it reserved for timers and the control ticker.
 //! TIM2 用作 Embassy 时间驱动，请勿将其用于其他外设功能。
 
@@ -12,13 +14,23 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_stm32::can::config::NominalBitTiming;
 use embassy_stm32::can::{self, BufferedCan, CanConfigurator, RxBuf, TxBuf};
+use embassy_stm32::dma;
+use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::mode::Async;
 use embassy_stm32::rcc::mux::Fdcansel;
 use embassy_stm32::rcc::{Hse, HseMode};
 use embassy_stm32::time::Hertz;
+use embassy_stm32::usart::{self, Parity, StopBits, UartRx};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{bind_interrupts, pac};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer};
 
 use static_cell::StaticCell;
+
+pub type RemoteRx = UartRx<'static, Async>;
+pub static REMOTE: Signal<CriticalSectionRawMutex, Option<Dr16>> = Signal::new();
 
 pub type Can1 = BufferedCan<'static, 4, 16>;
 static CAN_TX: StaticCell<TxBuf<4>> = StaticCell::new();
@@ -35,6 +47,8 @@ const WATCHDOG_TIMEOUT_US: u32 = 100_000;
 // Bind both FDCAN1 interrupt lines to Embassy so its async driver can wake waiting tasks.
 // 将 FDCAN1 的两路中断绑定到 Embassy，使异步驱动能够唤醒等待中的任务。
 bind_interrupts!(struct Irqs {
+    UART5 => usart::InterruptHandler<embassy_stm32::peripherals::UART5>;
+    DMA1_STREAM5 => dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH5>;
     FDCAN1_IT0 => can::IT0InterruptHandler<embassy_stm32::peripherals::FDCAN1>;
     FDCAN1_IT1 => can::IT1InterruptHandler<embassy_stm32::peripherals::FDCAN1>;
 });
@@ -43,8 +57,8 @@ bind_interrupts!(struct Irqs {
 // Keep hardware setup here. Implement motor and control exercises in main.rs.
 // 硬件配置放在此模块，电机和控制练习在 main.rs 中实现。
 
-/// Check the reset cause, start the watchdog, and initialize classic CAN1 at 1 Mbit/s.
-/// 检查复位原因，启动看门狗，并以 1 Mbit/s 初始化经典 CAN1。
+/// Check reset cause and return buffered CAN1, the started watchdog, and DR16 UART RX.
+/// 检查复位原因，返回带缓冲的 CAN1、已启动的看门狗和 DR16 UART 接收驱动。
 ///
 /// Call once at startup: Embassy takes ownership of the MCU peripherals here.
 /// 启动时只调用一次：Embassy 在此取得 MCU 外设的所有权。
@@ -53,7 +67,7 @@ bind_interrupts!(struct Irqs {
 ///
 /// Power the board from USB or its normal input; probe power alone cannot power CAN transceivers.
 /// 请通过 USB 或正常电源输入为开发板供电，调试探针供电不足以使 CAN 收发器工作。
-pub fn init() -> (Can1, Watchdog) {
+pub fn init() -> (Can1, Watchdog, RemoteRx) {
     // ========= Watchdog reset lockout / 看门狗复位后锁定 =========
     // RM0468, RCC_RSR: flags persist until RMVF is set. Clear before halting so a later
     // manual reset can resume. Never reach CAN setup or the student task on this boot.
@@ -106,7 +120,93 @@ pub fn init() -> (Can1, Watchdog) {
     let can = can
         .into_normal_mode()
         .buffered(CAN_TX.init(TxBuf::new()), CAN_RX.init(RxBuf::new()));
-    (can, watchdog)
+    // ========= DR16 DBUS input / DR16 遥控输入 =========
+    // The board inverts DBUS before PD2, so software RX inversion stays disabled.
+    // 板载电路已在 PD2 前反相 DBUS，软件无需再次反相。
+    let mut remote_config = usart::Config::default();
+    remote_config.baudrate = 100_000;
+    remote_config.parity = Parity::ParityEven;
+    remote_config.stop_bits = StopBits::STOP2;
+    let remote = UartRx::new(p.UART5, p.PD2, p.DMA1_CH5, Irqs, remote_config).unwrap();
+    // Keep the board's switched 5 V rail enabled for the receiver.
+    // 保持板载受控 5 V 电源开启，为接收机供电。
+    core::mem::forget(Output::new(p.PC15, Level::High, Speed::Low));
+    (can, watchdog, remote)
+}
+
+// ========= DR16 receiver / DR16 接收机 =========
+
+/// One valid 18-byte DBUS frame. No axis remapping or stick deadzone is applied.
+/// 一帧有效的 18 字节 DBUS 数据，不进行坐标变换或摇杆死区处理。
+#[derive(Clone, Copy)]
+pub struct Dr16 {
+    /// Right horizontal/vertical, left horizontal/vertical, wheel; centered counts, -660..=660.
+    /// 右横、右纵、左横、左纵、拨轮，中心为 0，范围为 -660..=660。
+    pub channels: [i16; 5],
+    /// Wire values: 1 up, 2 down, 3 middle.
+    /// 协议值：1 上，2 下，3 中。
+    pub right_switch: u8,
+    pub left_switch: u8,
+    pub mouse: [i16; 3],
+    pub mouse_left: bool,
+    pub mouse_right: bool,
+    /// Bits 0..15: W S A D Shift Ctrl Q E R F G Z X C V B.
+    pub keys: u16,
+}
+
+impl Dr16 {
+    /// Reject partial frames, invalid channels, and invalid switch values.
+    /// 拒绝不完整帧、越界通道值和无效开关值。
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let b: &[u8; 18] = bytes.try_into().ok()?;
+        let u = |i: usize| u16::from(b[i]);
+        let channels = [
+            u(0) | u(1) << 8,
+            u(1) >> 3 | u(2) << 5,
+            u(2) >> 6 | u(3) << 2 | u(4) << 10,
+            u(4) >> 1 | u(5) << 7,
+            u(16) | u(17) << 8,
+        ]
+        .map(|value| (value & 0x7ff) as i16 - 1024);
+        let right_switch = b[5] >> 4 & 3;
+        let left_switch = b[5] >> 6 & 3;
+        if channels.iter().any(|value| !(-660..=660).contains(value))
+            || !(1..=3).contains(&right_switch)
+            || !(1..=3).contains(&left_switch)
+        {
+            return None;
+        }
+        let signed = |i: usize| i16::from_le_bytes([b[i], b[i + 1]]);
+        Some(Self {
+            channels,
+            right_switch,
+            left_switch,
+            mouse: [signed(6), signed(8), signed(10)],
+            mouse_left: b[12] != 0,
+            mouse_right: b[13] != 0,
+            keys: u16::from_le_bytes([b[14], b[15]]),
+        })
+    }
+}
+
+/// Wait for UART idle to align frames; publish the latest input without queueing old commands.
+/// 通过 UART 空闲间隔对齐数据帧，只发布最新输入，不积压旧遥控指令。
+/// See the DJI DT7/DR16 manual for the 18-byte DBUS layout.
+/// 18 字节 DBUS 布局见 DJI DT7/DR16 手册。
+#[embassy_executor::task]
+pub async fn remote_task(mut rx: RemoteRx) {
+    // Larger than one frame so a full read does not hide a missing idle boundary.
+    // 缓冲区大于一帧，避免刚好填满时掩盖缺失的空闲间隔。
+    let mut bytes = [0; 36];
+    loop {
+        match rx.read_until_idle(&mut bytes).await {
+            Ok(n) => REMOTE.signal(Dr16::parse(&bytes[..n])),
+            Err(_) => {
+                REMOTE.signal(None);
+                Timer::after(Duration::from_millis(1)).await;
+            }
+        }
+    }
 }
 
 // ========= Panic watchdog reset / Panic 看门狗复位 =========

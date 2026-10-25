@@ -22,6 +22,7 @@ embassy-stm32 = { version = "0.6", default-features = false, features = [
     "unstable-pac",
 ] }
 embassy-time = "0.5"
+embassy-sync = "0.8"
 embedded-can = "0.4"
 static_cell = "2.1"
 rtt-target = "0.6"
