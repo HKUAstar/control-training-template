@@ -1,7 +1,8 @@
 # Control training template
 
 An Embassy starter for the DM-MC02 with an STM32H723VG. Students implement a GM6020-style
-motor protocol, PID, and state machine. The starter stays in `Waiting` and sends no motor commands.
+motor protocol, PID, and state machine. With no motors configured, the starter stays in `Waiting`
+and sends no motor commands.
 
 There are two source files:
 
@@ -29,14 +30,17 @@ transceivers. Connect CAN ground and terminate both ends of the bus with 120 ohm
 ## Exercises
 
 1. Implement `Motor::read` and `Motor::transmit`. Use the GM6020 manual to choose CAN IDs, byte
-   order, signed values, scaling, and limits. The transmit array has four slots for motor IDs
-   1 through 4. Encode zero for `None`. The function returns eight payload bytes; choose the
-   group CAN ID when constructing the frame in the task.
+   order, signed values, scaling, and limits. The provided routing uses feedback IDs `0x205` through
+   `0x208` and current-mode group ID `0x1FE`; adapt the constants for another protocol.
+   The transmit array has four slots for motor IDs 1 through 4. Encode zero for `None`.
+   The function returns eight payload bytes; `MOTOR_COMMAND_ID` sets the group CAN ID.
 2. Add PID fields and implement `reset` and `calculate`. The initial exercise controls speed in
    rpm and produces a current command in amperes. Pass `0.001` for the 1 ms tick period.
-3. Fill in `Control::read_feedback` and `Control::transmit`. Route feedback CAN IDs to motors
-   and send the group command on CAN1. Keep reads and writes bounded so a missing frame or full
-   transmit queue cannot stall the control tick. Embassy's buffered CAN API is one option.
+3. CAN transport is provided: interrupts buffer incoming frames, and `Control::read_feedback`
+   processes at most eight queued entries per tick. Only eight-byte standard data frames for
+   configured motors reach `Motor::read`. `Control::transmit` calls `Motor::transmit` and queues
+   one group frame per tick when any motor is configured. A full transmit queue triggers panic
+   and the existing watchdog-reset lockout, rather than blocking the control loop.
 4. Implement `Control::update_mode`: `Waiting` waits for hardware, `Prepare` resets controllers,
    and `Running` enables normal control. Require an explicit enable request before leaving
    `Waiting`, including after a reset. `Error` is available for debugging. Track feedback age
@@ -44,24 +48,28 @@ transceivers. Connect CAN ground and terminate both ends of the bus with 120 ohm
 5. Implement `Control::update` to calculate current commands. Keep outputs zero outside `Running`
    and for motors with missing feedback.
 
-Each tick calls `read_feedback`, `update_mode`, `update`, then `transmit`. The empty stages keep
-startup runnable. Section comments provide instructions in English and Chinese.
-每个周期依次读取反馈、更新模式、计算控制量并发送指令。各阶段初始为空，便于直接运行。
+Each tick calls `read_feedback`, `update_mode`, `update`, then `transmit`. With all motor slots
+set to `None`, startup stays runnable. Section comments provide instructions in English and Chinese.
+每个周期依次读取反馈、更新模式、计算控制量并发送指令。所有电机槽位初始为 `None`，便于直接运行。
 代码分区注释提供中英文练习说明。
 
-The `todo!()` functions panic if called. The starter does not call them. Add motors to the array
-and PID instances as needed for your exercise. The angle is in radians, speed and target are in
+The `todo!()` functions panic if called. With no motors configured, the starter does not call them.
+Implement both motor stubs before configuring a motor: transmission calls the encoder even in
+`Waiting`, and matching feedback calls the decoder. Add motors to the array and PID instances
+as needed for your exercise. The angle is in radians, speed and target are in
 rpm, and measured and commanded currents are in amperes. Students implement the wire conversions;
 do not send amperes as raw protocol counts.
 
 ## Stopping motors
 
 `Motor::disable()` clears a motor's target and current command in RAM. `Control::disable_all()`
-clears all configured motors. Each tick clears commands outside `Running`, before transmission.
-Students must implement the transmit stage to send those zero commands over CAN.
+clears all configured motors. The transmit stage clears commands outside `Running` before
+calling the student encoder.
+Students must implement `Motor::transmit` so those cleared commands encode as zero on the wire.
 
 `Motor::disable()` 清除内存中的目标值和电流指令，`Control::disable_all()` 清除所有已配置电机的指令。
-每个周期在非 `Running` 模式下清零，再进入发送阶段。仍需实现 CAN 发送才能让电机收到零指令。
+发送阶段在非 `Running` 模式下清零。仍需实现 `Motor::transmit`，
+将清零后的指令编码为协议零值。
 
 IWDG1 runs with a nominal 100 ms timeout and is fed only after a completed control tick.
 If the task hangs, the watchdog resets the MCU. On panic, interrupts are disabled and a fresh
@@ -103,6 +111,8 @@ MCU/CAN 复位后，电机输出依靠电机控制器端的指令超时机制关
 零电流不代表主动刹车或机械上的立即停止。任何重启后都需要新反馈和明确的使能请求，才能进入 `Prepare`。
 
 References: [Embassy CAN API](https://docs.embassy.dev/embassy-stm32/0.6.0/stm32h723vg/can/index.html)
-and [DJI GM6020 documentation](https://www.robomaster.com/en-US/products/components/general/GM6020).
+and
+[DJI GM6020 documentation](https://www.robomaster.com/en-US/products/components/general/GM6020).
 
-Watchdog/reset reference: [STM32H723 reference manual RM0468](https://www.st.com/resource/en/reference_manual/dm00603761.pdf).
+Watchdog/reset reference:
+[STM32H723 reference manual RM0468](https://www.st.com/resource/en/reference_manual/dm00603761.pdf).

@@ -11,12 +11,18 @@ use core::num::{NonZeroU8, NonZeroU16};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_stm32::can::config::NominalBitTiming;
-use embassy_stm32::can::{self, Can, CanConfigurator};
+use embassy_stm32::can::{self, BufferedCan, CanConfigurator, RxBuf, TxBuf};
 use embassy_stm32::rcc::mux::Fdcansel;
 use embassy_stm32::rcc::{Hse, HseMode};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{bind_interrupts, pac};
+
+use static_cell::StaticCell;
+
+pub type Can1 = BufferedCan<'static, 4, 16>;
+static CAN_TX: StaticCell<TxBuf<4>> = StaticCell::new();
+static CAN_RX: StaticCell<RxBuf<16>> = StaticCell::new();
 
 pub type Watchdog = IndependentWatchdog<'static, embassy_stm32::peripherals::IWDG1>;
 
@@ -47,7 +53,7 @@ bind_interrupts!(struct Irqs {
 ///
 /// Power the board from USB or its normal input; probe power alone cannot power CAN transceivers.
 /// 请通过 USB 或正常电源输入为开发板供电，调试探针供电不足以使 CAN 收发器工作。
-pub fn init() -> (Can<'static>, Watchdog) {
+pub fn init() -> (Can1, Watchdog) {
     // ========= Watchdog reset lockout / 看门狗复位后锁定 =========
     // RM0468, RCC_RSR: flags persist until RMVF is set. Clear before halting so a later
     // manual reset can resume. Never reach CAN setup or the student task on this boot.
@@ -95,7 +101,12 @@ pub fn init() -> (Can<'static>, Watchdog) {
     }));
     // Normal mode connects to the physical bus; this is not an internal loopback test.
     // 正常模式连接实际总线，此处不使用内部回环测试。
-    (can.into_normal_mode(), watchdog)
+    // Interrupts buffer frames; the control task reads and writes without waiting.
+    // 中断负责缓存帧，控制任务以非阻塞方式读取和发送。
+    let can = can
+        .into_normal_mode()
+        .buffered(CAN_TX.init(TxBuf::new()), CAN_RX.init(RxBuf::new()));
+    (can, watchdog)
 }
 
 // ========= Panic watchdog reset / Panic 看门狗复位 =========

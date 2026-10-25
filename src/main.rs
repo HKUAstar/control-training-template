@@ -4,9 +4,17 @@
 
 mod dm_mc02;
 
+use dm_mc02::Can1;
 use embassy_executor::Spawner;
-use embassy_stm32::can::Can;
+use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Ticker};
+use embedded_can::Id;
+
+// GM6020 current-mode IDs for motors 1 through 4; adapt these for another protocol.
+// GM6020 电流模式下电机 1 至 4 的 ID，使用其他协议时请修改。
+const MOTOR_FEEDBACK_FIRST_ID: u16 = 0x205;
+const MOTOR_COMMAND_ID: u16 = 0x1FE;
+const MAX_RX_FRAMES_PER_TICK: usize = 8;
 
 // ========= Motor feedback and commands / 电机反馈与指令 =========
 // Implement the wire protocol here. Keep physical values in the units shown below.
@@ -119,13 +127,10 @@ impl Control {
     // ========= Tick order / 每周期执行顺序 =========
     // Run every 1 ms. Check feedback and mode before calculating or sending commands.
     // 每 1 ms 执行一次，先检查反馈和模式，再计算和发送指令。
-    pub fn tick(&mut self, can: &mut Can<'static>) {
+    pub fn tick(&mut self, can: &mut Can1) {
         self.read_feedback(can);
         self.update_mode();
         self.update();
-        if self.state != State::Running {
-            self.disable_all();
-        }
         self.transmit(can);
     }
 
@@ -134,7 +139,35 @@ impl Control {
     // 读取已有帧，根据 CAN ID 找到对应电机，再调用 Motor::read。
     // Track feedback age in ticks. Bound receive work so missing frames cannot block a tick.
     // 用周期数记录反馈年龄，限制每周期接收工作量，避免等待缺失帧阻塞控制。
-    pub fn read_feedback(&mut self, _can: &mut Can<'static>) {}
+    pub fn read_feedback(&mut self, can: &mut Can1) {
+        let receiver = can.reader();
+        for _ in 0..MAX_RX_FRAMES_PER_TICK {
+            let Ok(received) = receiver.try_receive() else {
+                break;
+            };
+            let Ok(envelope) = received else {
+                continue;
+            };
+            let frame = envelope.frame;
+            if frame.header().rtr() {
+                continue;
+            }
+            let Id::Standard(id) = frame.id() else {
+                continue;
+            };
+            let Some(index) = id.as_raw().checked_sub(MOTOR_FEEDBACK_FIRST_ID) else {
+                continue;
+            };
+            let Ok(data) = <&[u8; 8]>::try_from(frame.data()) else {
+                continue;
+            };
+            if let Some(Some(motor)) = self.motors.get_mut(usize::from(index)) {
+                motor.read(data);
+                // Add feedback-age tracking here for the mode-transition exercise.
+                // 在此添加反馈超时记录，用于模式切换练习。
+            }
+        }
+    }
 
     // ========= Update mode / 更新模式 =========
     // Define transition conditions. Missing feedback must return to Waiting before control.
@@ -174,7 +207,21 @@ impl Control {
     // 调用 Motor::transmit，使用组指令 CAN ID 构造帧，然后通过 CAN1 发送。
     // Send zero commands outside Running. Do not wait indefinitely for a free transmit slot.
     // 非 Running 模式发送零指令，不要无限等待空闲的发送槽位。
-    pub fn transmit(&mut self, _can: &mut Can<'static>) {}
+    pub fn transmit(&mut self, can: &mut Can1) {
+        if self.motors.iter().all(Option::is_none) {
+            return;
+        }
+        if self.state != State::Running {
+            self.disable_all();
+        }
+        let data = Motor::transmit(&self.motors);
+        let frame = Frame::new_standard(MOTOR_COMMAND_ID, &data).unwrap();
+        // A full queue is a fault: panic resets CAN rather than accumulating old commands.
+        // 发送队列满视为故障，通过 panic 复位 CAN，避免继续累积旧指令。
+        can.writer()
+            .try_write(frame)
+            .expect("CAN1 transmit queue full");
+    }
 }
 
 // ========= Startup and RTT / 启动与 RTT =========
@@ -206,7 +253,7 @@ async fn main(spawner: Spawner) {
 /// Ticker schedules periodic deadlines. Keep each tick below 1 ms to avoid missing them.
 /// Ticker 按固定周期安排截止时间，每次 tick 应在 1 ms 内完成，避免错过截止时间。
 #[embassy_executor::task]
-async fn control_task(mut can: Can<'static>, mut watchdog: dm_mc02::Watchdog) {
+async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
     let mut control = Control::default();
     let mut ticker = Ticker::every(Duration::from_millis(1));
     loop {
