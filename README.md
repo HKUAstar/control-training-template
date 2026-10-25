@@ -5,7 +5,7 @@ motor protocol, PID, and state machine. The starter stays in `Waiting` and sends
 
 There are two source files:
 
-- `src/dm_mc02.rs`: clocks and CAN1 setup.
+- `src/dm_mc02.rs`: clocks, CAN1, watchdog, and panic handling.
 - `src/main.rs`: entry point, RTT, 1 kHz control task, and exercises.
 
 ## Build and run

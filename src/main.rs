@@ -4,8 +4,6 @@
 
 mod dm_mc02;
 
-use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_stm32::can::Can;
 use embassy_time::{Duration, Ticker};
@@ -217,25 +215,4 @@ async fn control_task(mut can: Can<'static>, mut watchdog: dm_mc02::Watchdog) {
         // Feed the watchdog to prevent a reset while the control loop is healthy.
         watchdog.pet();
     }
-}
-
-// ========= Panic shutdown / Panic 停机 =========
-/// Print once without waiting for the host, then force an independent-watchdog reset.
-/// 不等待主机，尝试打印一次消息，然后触发独立看门狗复位。
-///
-/// RTT delivery is best effort: reset can occur before the host reads the message.
-/// RTT 消息不保证送达：主机读取之前可能已经复位。
-/// Interrupts stay disabled so no interrupt can feed the watchdog or continue CAN service.
-/// 禁用中断，防止中断继续喂狗或执行 CAN 服务。
-/// On the next boot, dm_mc02::init halts before CAN and student code until a manual reset.
-/// 下次启动时，dm_mc02::init 会在 CAN 和学生代码之前停机，等待手动复位。
-#[panic_handler]
-fn panic(info: &PanicInfo<'_>) -> ! {
-    static PANICKED: AtomicBool = AtomicBool::new(false);
-
-    cortex_m::interrupt::disable();
-    if !PANICKED.swap(true, Ordering::Relaxed) {
-        rtt_target::rprintln!("{}", info);
-    }
-    dm_mc02::panic_reset()
 }

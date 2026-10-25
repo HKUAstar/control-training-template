@@ -7,6 +7,8 @@
 //! TIM2 用作 Embassy 时间驱动，请勿将其用于其他外设功能。
 
 use core::num::{NonZeroU8, NonZeroU16};
+use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_stm32::can::config::NominalBitTiming;
 use embassy_stm32::can::{self, Can, CanConfigurator};
 use embassy_stm32::rcc::mux::Fdcansel;
@@ -107,7 +109,7 @@ pub fn init() -> (Can<'static>, Watchdog) {
 /// 它不是同步复位指令。
 /// See RM0468, independent watchdog (IWDG) and RCC reset-status register (RCC_RSR).
 /// 参见 RM0468 的独立看门狗和 RCC 复位状态寄存器章节。
-pub fn panic_reset() -> ! {
+fn panic_reset() -> ! {
     use pac::iwdg::vals::{Key, Pr};
 
     let wdg = pac::IWDG1;
@@ -125,4 +127,25 @@ pub fn panic_reset() -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+// ========= Panic shutdown / Panic 停机 =========
+/// Print once without waiting for the host, then force an independent-watchdog reset.
+/// 不等待主机，尝试打印一次消息，然后触发独立看门狗复位。
+///
+/// RTT delivery is best effort: reset can occur before the host reads the message.
+/// RTT 消息不保证送达：主机读取之前可能已经复位。
+/// Interrupts stay disabled so no interrupt can feed the watchdog or continue CAN service.
+/// 禁用中断，防止中断继续喂狗或执行 CAN 服务。
+/// On the next boot, dm_mc02::init halts before CAN and student code until a manual reset.
+/// 下次启动时，dm_mc02::init 会在 CAN 和学生代码之前停机，等待手动复位。
+#[panic_handler]
+fn panic(info: &PanicInfo<'_>) -> ! {
+    static PANICKED: AtomicBool = AtomicBool::new(false);
+
+    cortex_m::interrupt::disable();
+    if !PANICKED.swap(true, Ordering::Relaxed) {
+        rtt_target::rprintln!("{}", info);
+    }
+    panic_reset()
 }
