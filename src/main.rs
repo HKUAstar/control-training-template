@@ -59,8 +59,8 @@ impl Pid {
         todo!("Clear PID history");
     }
 
-    /// 速度环输入 rpm、输出 A；dt_s 为周期秒数。
-    pub fn calculate(&mut self, _target_rpm: f32, _measured_rpm: f32, _dt_s: f32) -> f32 {
+    /// 单位由调用处约定：速度环 rpm → A，角度环 rad → rpm；dt_s 为秒。
+    pub fn calculate(&mut self, _target: f32, _measured: f32, _dt_s: f32) -> f32 {
         // 待补全：使用 dt_s 计算 PID，并限制积分和输出。
         todo!("Implement PID");
     }
@@ -184,8 +184,8 @@ impl Control {
         if self.motors.iter().all(Option::is_none) {
             return;
         }
-        // 待调整：允许受限回正输出，等待和故障仍须清零。
-        if self.state != State::Running {
+        // 仅允许回正或调试状态输出，且遥控输入必须有效。
+        if self.remote.is_none() || !matches!(self.state, State::Prepare | State::Running) {
             self.disable_all();
         }
         let data = Motor::transmit(&self.motors);
