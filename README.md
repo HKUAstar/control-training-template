@@ -30,15 +30,16 @@ transceivers. Connect CAN ground and terminate both ends of the bus with 120 ohm
 ## Exercises
 
 1. Implement `Motor::read` and `Motor::transmit`. Use the GM6020 manual to choose CAN IDs, byte
-   order, signed values, scaling, and limits. The provided routing uses feedback IDs `0x205` through
-   `0x208` and current-mode group ID `0x1FE`; adapt the constants for another protocol.
+   order, signed values, scaling, and limits. GM6020 IDs 1 through 4 use feedback IDs `0x205`
+   through `0x208`. The provided current-mode command ID is `0x1FE`; adapt for another protocol.
    The transmit array has four slots for motor IDs 1 through 4. Encode zero for `None`.
    The function returns eight payload bytes; `MOTOR_COMMAND_ID` sets the group CAN ID.
 2. Add PID fields and implement `reset` and `calculate`. The initial exercise controls speed in
    rpm and produces a current command in amperes. Pass `0.001` for the 1 ms tick period.
 3. CAN transport is provided: interrupts buffer incoming frames, and `Control::read_feedback`
-   processes at most eight queued entries per tick. Only eight-byte standard data frames for
-   configured motors reach `Motor::read`. `Control::transmit` calls `Motor::transmit` and queues
+   shows a nonblocking `try_receive()` loop for at most eight queued entries per tick. Implement
+   CAN ID filtering, payload checks, and routing to the matching `Motor::read` yourself.
+   `Control::transmit` calls `Motor::transmit` and queues
    one group frame per tick when any motor is configured. A full transmit queue triggers panic
    and the existing watchdog-reset lockout, rather than blocking the control loop.
 4. Implement `Control::update_mode`: `Waiting` waits for hardware, `Prepare` resets controllers,
@@ -55,8 +56,8 @@ set to `None`, startup stays runnable. Section comments provide instructions in 
 
 The `todo!()` functions panic if called. With no motors configured, the starter does not call them.
 Implement both motor stubs before configuring a motor: transmission calls the encoder even in
-`Waiting`, and matching feedback calls the decoder. Add motors to the array and PID instances
-as needed for your exercise. The angle is in radians, speed and target are in
+`Waiting`. Your feedback-routing code should call the decoder for matching frames.
+Add motors to the array and PID instances as needed for your exercise. The angle is in radians, speed and target are in
 rpm, and measured and commanded currents are in amperes. Students implement the wire conversions;
 do not send amperes as raw protocol counts.
 

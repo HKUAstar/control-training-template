@@ -8,11 +8,9 @@ use dm_mc02::Can1;
 use embassy_executor::Spawner;
 use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Ticker};
-use embedded_can::Id;
 
-// GM6020 current-mode IDs for motors 1 through 4; adapt these for another protocol.
-// GM6020 电流模式下电机 1 至 4 的 ID，使用其他协议时请修改。
-const MOTOR_FEEDBACK_FIRST_ID: u16 = 0x205;
+// GM6020 current-mode group ID for motors 1 through 4; adapt for another protocol.
+// GM6020 电流模式下电机 1 至 4 的组指令 ID，使用其他协议时请修改。
 const MOTOR_COMMAND_ID: u16 = 0x1FE;
 const MAX_RX_FRAMES_PER_TICK: usize = 8;
 
@@ -142,30 +140,16 @@ impl Control {
     pub fn read_feedback(&mut self, can: &mut Can1) {
         let receiver = can.reader();
         for _ in 0..MAX_RX_FRAMES_PER_TICK {
-            let Ok(received) = receiver.try_receive() else {
+            let Ok(Ok(envelope)) = receiver.try_receive() else {
                 break;
             };
-            let Ok(envelope) = received else {
-                continue;
-            };
-            let frame = envelope.frame;
-            if frame.header().rtr() {
-                continue;
-            }
-            let Id::Standard(id) = frame.id() else {
-                continue;
-            };
-            let Some(index) = id.as_raw().checked_sub(MOTOR_FEEDBACK_FIRST_ID) else {
-                continue;
-            };
-            let Ok(data) = <&[u8; 8]>::try_from(frame.data()) else {
-                continue;
-            };
-            if let Some(Some(motor)) = self.motors.get_mut(usize::from(index)) {
-                motor.read(data);
-                // Add feedback-age tracking here for the mode-transition exercise.
-                // 在此添加反馈超时记录，用于模式切换练习。
-            }
+            let _frame = envelope.frame;
+            // Filter the CAN ID, check the payload, and call the matching motor's read method.
+            // 筛选 CAN ID，检查数据长度，再调用对应电机的 read 方法。
+            // Rename _frame to frame when implementing this exercise; use id() and data().
+            // 实现时将 _frame 改为 frame，使用 id() 和 data() 获取标识符与数据。
+            // Record feedback age for the mode-transition exercise.
+            // 记录反馈超时信息，用于模式切换练习。
         }
     }
 
